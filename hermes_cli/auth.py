@@ -404,7 +404,19 @@ def _save_auth_store(auth_store: Dict[str, Any]) -> Path:
     payload = json.dumps(auth_store, indent=2) + "\n"
     tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
+        # Create temp file with owner-only permissions from the start (mode 0o600)
+        # to avoid a window where the file is world-readable between creation and
+        # the subsequent chmod call.  O_EXCL ensures we never open an existing
+        # file (prevents symlink attacks against the tmp path).
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        # os.fdopen() takes ownership of fd; the with-block closes it on exit.
+        # If os.fdopen() itself raises (very rare), close fd to prevent a leak.
+        try:
+            fobj = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        with fobj as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
@@ -424,7 +436,7 @@ def _save_auth_store(auth_store: Dict[str, Any]) -> Path:
                 tmp_path.unlink()
         except OSError:
             pass
-    # Restrict file permissions to owner only
+    # Ensure final file also has owner-only permissions (covers os.replace on some platforms)
     try:
         auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except OSError:

@@ -40,17 +40,122 @@ Usage:
 #TODO: Store the pages in something
 #TODO: Tool to see what pages are available/saved to search over
 
+import ipaddress
 import json
 import logging
 import os
 import re
 import asyncio
+import socket
+import urllib.parse
 from typing import List, Dict, Any, Optional
 from firecrawl import Firecrawl
 from agent.auxiliary_client import async_call_llm
 from tools.debug_helpers import DebugSession
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SSRF protection
+# ---------------------------------------------------------------------------
+
+# IP ranges that must never be fetched (private/link-local/loopback/reserved).
+_SSRF_BLOCKED_NETWORKS = [
+    ipaddress.ip_network(cidr) for cidr in (
+        "127.0.0.0/8",       # IPv4 loopback
+        "::1/128",           # IPv6 loopback
+        "10.0.0.0/8",        # RFC-1918 private
+        "172.16.0.0/12",     # RFC-1918 private
+        "192.168.0.0/16",    # RFC-1918 private
+        "169.254.0.0/16",    # IPv4 link-local (AWS/GCP metadata)
+        "fc00::/7",          # IPv6 unique-local
+        "fe80::/10",         # IPv6 link-local
+        "0.0.0.0/8",         # "This" network
+        "100.64.0.0/10",     # CGNAT shared address space
+        "192.0.0.0/24",      # IANA special-purpose
+        "198.18.0.0/15",     # Benchmarking
+        "198.51.100.0/24",   # TEST-NET-2 (documentation)
+        "203.0.113.0/24",    # TEST-NET-3 (documentation)
+        "240.0.0.0/4",       # Reserved (future use)
+        "255.255.255.255/32", # Broadcast
+    )
+]
+
+
+class _SsrfBlockedError(ValueError):
+    """Raised when a URL targets a private/internal address (SSRF protection)."""
+
+
+def _is_ssrf_blocked(host: str) -> bool:
+    """Return True when *host* resolves to a private/internal address.
+
+    Resolves the hostname to all its IP addresses and checks each against the
+    blocked-network list.  Logs a warning and returns True (fail-secure) on
+    DNS resolution failures to prevent bypass via DNS errors.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        logger.warning(
+            "SSRF check: DNS resolution failed for host %r (%s); "
+            "blocking request (fail-secure)",
+            host,
+            exc,
+        )
+        return True
+    for info in infos:
+        raw_addr = info[4][0]
+        try:
+            addr = ipaddress.ip_address(raw_addr)
+        except ValueError:
+            continue
+        for net in _SSRF_BLOCKED_NETWORKS:
+            if addr in net:
+                return True
+    return False
+
+
+def _validate_url_not_ssrf(url: str) -> None:
+    """Raise _SsrfBlockedError if *url* targets a private/internal address (SSRF).
+
+    Only https:// and http:// schemes are accepted; other schemes (file://,
+    ftp://, etc.) are rejected outright.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception as exc:
+        raise _SsrfBlockedError(f"Invalid URL: {url!r}") from exc
+
+    if parsed.scheme not in ("http", "https"):
+        raise _SsrfBlockedError(
+            f"URL scheme {parsed.scheme!r} is not allowed. "
+            "Only http:// and https:// are permitted."
+        )
+
+    host = parsed.hostname
+    if not host:
+        raise _SsrfBlockedError(f"URL has no host: {url!r}")
+
+    # Reject bare IP literals that fall in blocked ranges without a DNS lookup
+    try:
+        addr = ipaddress.ip_address(host)
+        for net in _SSRF_BLOCKED_NETWORKS:
+            if addr in net:
+                raise _SsrfBlockedError(
+                    f"Requests to private/internal addresses are not allowed: {host!r}"
+                )
+        # It's a public IP literal — no DNS lookup needed
+        return
+    except _SsrfBlockedError:
+        raise
+    except ValueError:
+        pass  # host is not an IP literal — do DNS resolution check below
+
+    if _is_ssrf_blocked(host):
+        raise _SsrfBlockedError(
+            f"Requests to private/internal addresses are not allowed: {host!r}"
+        )
+
 
 _firecrawl_client = None
 
@@ -617,6 +722,12 @@ async def web_extract_tool(
                 continue
 
             try:
+                _validate_url_not_ssrf(url)
+            except _SsrfBlockedError as ssrf_err:
+                results.append({"url": url, "error": str(ssrf_err), "title": ""})
+                continue
+
+            try:
                 logger.info("Scraping: %s", url)
                 scrape_result = _get_firecrawl_client().scrape(
                     url=url,
@@ -866,6 +977,9 @@ async def web_crawl_tool(
         if not url.startswith(('http://', 'https://')):
             url = f'https://{url}'
             logger.info("Added https:// prefix to URL: %s", url)
+
+        # SSRF protection: reject private/internal URLs before crawling
+        _validate_url_not_ssrf(url)
         
         instructions_text = f" with instructions: '{instructions}'" if instructions else ""
         logger.info("Crawling %s%s", url, instructions_text)

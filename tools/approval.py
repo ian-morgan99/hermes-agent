@@ -303,6 +303,10 @@ def check_dangerous_command(command: str, env_type: str,
 
     # --yolo: bypass all approval prompts
     if os.getenv("HERMES_YOLO_MODE"):
+        logger.warning(
+            "YOLO mode active (HERMES_YOLO_MODE): skipping approval for command: %s",
+            command[:120],
+        )
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
@@ -374,6 +378,10 @@ def check_all_command_guards(command: str, env_type: str,
 
     # --yolo: bypass all approval prompts and pre-exec guard checks
     if os.getenv("HERMES_YOLO_MODE"):
+        logger.warning(
+            "YOLO mode active (HERMES_YOLO_MODE): skipping all security guards for command: %s",
+            command[:120],
+        )
         return {"approved": True, "message": None}
 
     is_cli = os.getenv("HERMES_INTERACTIVE")

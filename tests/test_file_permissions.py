@@ -131,5 +131,72 @@ class TestSecureHelpers(unittest.TestCase):
         _secure_dir(Path("/nonexistent/path"))  # Should not raise
 
 
+class TestAuthStoreFilePermissions(unittest.TestCase):
+    """Verify _save_auth_store creates auth.json with owner-only permissions.
+
+    The temp file must be created with mode 0600 from the start so there is
+    no window where the file containing OAuth tokens is world-readable.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.hermes_home = Path(self.tmpdir) / ".hermes"
+        self.hermes_home.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _save(self):
+        from hermes_cli.auth import _save_auth_store, _auth_file_path
+        with patch("hermes_cli.auth._auth_file_path",
+                   return_value=self.hermes_home / "auth.json"):
+            auth_store = {"version": 1, "providers": {}}
+            _save_auth_store(auth_store)
+
+    def test_final_file_has_mode_0600(self):
+        """auth.json must have mode 0600 after a successful save."""
+        self._save()
+        auth_file = self.hermes_home / "auth.json"
+        self.assertTrue(auth_file.exists(), "auth.json should exist after save")
+        mode = stat.S_IMODE(os.stat(auth_file).st_mode)
+        self.assertEqual(mode, 0o600,
+                         f"Expected 0600 but got {oct(mode)}")
+
+    def test_temp_file_is_not_world_readable(self):
+        """The temp file must not be created with world-readable permissions.
+
+        We intercept os.replace to capture the temp file path before it is
+        renamed so we can stat it at creation time.
+        """
+        captured = {}
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            # Fail the test explicitly if stat raises — a silent OSError would
+            # hide permission issues rather than expose them.
+            mode = stat.S_IMODE(os.stat(src).st_mode)
+            captured["tmp_mode"] = mode
+            real_replace(src, dst)
+
+        with patch("hermes_cli.auth._auth_file_path",
+                   return_value=self.hermes_home / "auth.json"), \
+             patch("os.replace", side_effect=spy_replace):
+            self._save()
+
+        self.assertIn("tmp_mode", captured, "os.replace was not called")
+        # The temp file must be owner-only (no group/world read/write/exec)
+        tmp_mode = captured["tmp_mode"]
+        world_bits = tmp_mode & 0o077
+        self.assertEqual(world_bits, 0,
+                         f"Temp file had group/world bits set: {oct(tmp_mode)}")
+
+    def test_no_leftover_temp_file(self):
+        """No .tmp. files should remain after a successful save."""
+        self._save()
+        tmp_files = list(self.hermes_home.glob("auth.json.tmp.*"))
+        self.assertEqual(tmp_files, [], f"Leftover temp files: {tmp_files}")
+
+
 if __name__ == "__main__":
     unittest.main()
