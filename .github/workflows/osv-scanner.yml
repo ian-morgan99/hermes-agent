@@ -16,8 +16,8 @@ name: OSV-Scanner
 #
 # Uses Google's officially-recommended reusable workflow, pinned by SHA.
 # Findings land in the repo's Security tab (Code Scanning > OSV-Scanner).
-# fail-on-vuln is disabled so the job does not block merges on pre-existing
-# vulnerabilities in pinned deps that we may need to patch deliberately.
+# Known vulnerabilities in pinned dependencies block the workflow. This keeps
+# advisory reporting actionable and prevents vulnerable lockfiles from merging.
 #
 # The reusable workflow can't emit custom outputs, so a wrapper job
 # downloads the SARIF result and summarizes the vulnerability count into
@@ -53,7 +53,7 @@ jobs:
       # The upstream reusable workflow uploads this exact file under its
       # fixed artifact name, which the wrapper downloads below.
       results-file-name: osv-results.sarif
-      fail-on-vuln: false
+      fail-on-vuln: true
 
   emit-status:
     name: Emit review status
